@@ -7,12 +7,26 @@ const panic = std.debug.panic;
 const Allocator = std.mem.Allocator;
 const sio_err = @import("sio_errors.zig").sio_err;
 const I = @import("instruments.zig");
+const Instrument = I.Instrument;
 const G = @import("global_config.zig");
 const expect = std.testing.expect;
+const Order = std.math.Order;
 
-const global_volume: f32 = 0.25;
+fn beginsSooner(context: void, a: *Instrument, b: *Instrument) Order {
+    _ = context;
+    if (a.approx_start_time == b.approx_start_time) {
+        return Order.eq;
+    } else if (a.approx_start_time < b.approx_start_time) {
+        return Order.lt;
+    }
+    return Order.gt;
+}
 
-const Data = struct {
+const NoteQueue = std.PriorityQueue(*Instrument, void, beginsSooner);
+
+const global_volume: f32 = 0.20;
+
+const GlobalState = struct {
     bufL: []f32,
     bufR: []f32,
     // (constant) number of frames written at once is a multiple of n_frames
@@ -27,14 +41,14 @@ const Data = struct {
     n_frames_requested: u32 = 0,
     // seconds of audio actually written to audio buffer by write_callback
     // crucial to know where to start again to play new sounds
-    offset_seconds: f32 = 0,
+    global_t: f32 = 0,
 
     // /// mimicks what happens in write_callback
-    // fn test_consume_ready(data: *Data, n_max: u32) void {
-    //     if (n_max > data.n_frames_ready)
-    //         data.n_frames_requested += n_max - data.n_frames_ready;
+    // fn test_consume_ready(g_state: *GlobalState, n_max: u32) void {
+    //     if (n_max > g_state.n_frames_ready)
+    //         g_state.n_frames_requested += n_max - g_state.n_frames_ready;
     //     // copy buffer
-    //     data.n_frames_ready = 0;
+    //     g_state.n_frames_ready = 0;
     // }
 };
 
@@ -42,9 +56,21 @@ pub fn main() !u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try start_server(allocator, 200);
-    // TODO create sound queue
-    // queue = std.PriorityQueue()
+    var noteQueue = NoteQueue.init(allocator, undefined);
+    var instr1 = I.Sine.init(0, 0.5, 440.0);
+    var instr2 = I.Sine.init(0.5, 0.5, 440.0 * (4.0 / 3.0));
+    var instr3 = I.Sine.init(1.0, 0.25, 440.0 * (5.0 / 3.0));
+    var instr4 = I.Sine.init(1.25, 0.5, 440.0 * (3.0 / 3.0));
+    var instr5 = I.Sine.init(1.25, 0.5, 440.0 * (4.0 / 3.0));
+    var instr6 = I.Sine.init(1.25, 0.5, 440.0 * (5.0 / 3.0));
+
+    try noteQueue.add(&instr1.instrument);
+    try noteQueue.add(&instr2.instrument);
+    try noteQueue.add(&instr3.instrument);
+    try noteQueue.add(&instr4.instrument);
+    try noteQueue.add(&instr5.instrument);
+    try noteQueue.add(&instr6.instrument);
+    try start_server(allocator, 200, &noteQueue);
     return 0;
 }
 
@@ -54,64 +80,114 @@ inline fn print_vb(comptime fmt: []const u8, args: anytype, comptime verbose_lev
     }
 }
 
-pub fn play(alloc: Allocator, data: *Data) !void {
-    if (data.n_frames_ready > 0) { // data hasn't been read yet!
+pub fn play(
+    alloc: Allocator,
+    g_state: *GlobalState,
+    noteQueue: *NoteQueue,
+) !void {
+    if (g_state.n_frames_ready > 0) { // data hasn't been read yet!
         print_vb("NOT READ DATA!\n", .{}, 3);
         return;
     }
 
-    // only play multiples of data.n_frame. Necessary? sounds like a good idea for quantization purposes?
-    const additional = (data.n_frames_requested) / data.n_frames;
-    const frames_to_play = data.n_frames * (additional + 1);
+    // only play multiples of g_state.n_frame. Necessary? sounds like a good idea for quantization purposes?
+    const additional = (g_state.n_frames_requested) / g_state.n_frames;
+    const frames_to_play = g_state.n_frames * (additional + 1);
     print_vb("play(): #frames={} \n", .{frames_to_play}, 3);
-    // const frames_to_play = data.n_frames * additional;
-    const frames_left = data.n_frames_requested % data.n_frames;
+    // const frames_to_play = g_state.n_frames * additional;
+    const frames_left = g_state.n_frames_requested % g_state.n_frames;
     // play instruments, mix, etc.
-    // for now, just a sine wave on both channels
-    const buf: []f32 = try I.play_sine(alloc, data.offset_seconds, frames_to_play, global_volume);
+    // first, zero out the buffers
+    std.mem.set(f32, g_state.bufL[0..frames_to_play], 0);
+    std.mem.set(f32, g_state.bufR[0..frames_to_play], 0);
+    // there are 2 cases when we don't play anything
+    // - if there is no note in the queue
+    // - if the closest note in time is still to far in time
+    var dont_play: bool = false;
+    // tol: tolerance to decide if we can play the note or not
+    const tol = G.sec_per_frame * @intToFloat(f32, g_state.n_frames);
+    // intermediary buffer since we're doing mono
+    const buf = try alloc.alloc(f32, frames_to_play);
     defer alloc.free(buf);
-    // update data
-    std.mem.copy(f32, data.bufL[0..frames_to_play], buf);
-    std.mem.copy(f32, data.bufR[0..frames_to_play], buf);
-    data.n_frames_ready = frames_to_play;
-    data.offset_seconds += @intToFloat(f32, frames_to_play) / @intToFloat(f32, G.sample_rate);
-    data.n_frames_requested = frames_left;
-    print_vb("End play: preped {}, left {}\n", .{ data.n_frames_ready, data.n_frames_requested }, 3);
+    while (noteQueue.peek()) |elem| {
+        print_vb("Time {}, ftp {}\n", .{ g_state.global_t, frames_to_play }, 3);
+        if (elem.over) {
+            // remove notes that are over
+            alloc.destroy(noteQueue.remove());
+            print_vb("Stop playing instrument={} at time t={}\n", .{ elem, g_state.global_t }, 1);
+        } else {
+            // check that the next note to play is not too far in time
+            var time_delta = elem.approx_start_time - g_state.global_t;
+            if (time_delta > tol) {
+                // if it is too far in time, don't play anything
+                dont_play = true;
+            }
+            break;
+        }
+    }
+    if (!dont_play) {
+        // it'd be nice to iterate in the order of priority, but idk how to do
+        // that
+        var maybe_it = noteQueue.iterator();
+        while (maybe_it.next()) |it| {
+            const time_delta = g_state.global_t - it.approx_start_time;
+            if (time_delta > tol) {
+                const instr_buf = it.play(time_delta, frames_to_play, global_volume);
+                for (instr_buf) |*b, i| {
+                    buf[i] += b.*;
+                }
+                print_vb("Play {p} at time {}\n", .{ it, g_state.global_t }, 3);
+            }
+        }
+    }
+    // mono
+    std.mem.copy(f32, g_state.bufL[0..frames_to_play], buf[0..frames_to_play]);
+    std.mem.copy(f32, g_state.bufR[0..frames_to_play], buf[0..frames_to_play]);
+    // print("MAX {}\n", .{std.mem.max(f32, g_state.bufL[0..frames_to_play])});
+    // update global state
+    g_state.n_frames_ready = frames_to_play;
+    g_state.global_t += @intToFloat(f32, frames_to_play) / @intToFloat(f32, G.sample_rate);
+    g_state.n_frames_requested = frames_left;
+    print_vb("End play: preped {}, left {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested }, 3);
 }
 
 // test "play" {
 //     var alloc = std.testing.allocator;
 //     var bufL = [_]f32{0.0} ** (10 * 5);
 //     var bufR = [_]f32{0.0} ** (10 * 5);
-//     var data = Data{
+//     var g_state = GlobalState{
 //         .bufL = &bufL,
 //         .bufR = &bufR,
 //         .n_frames = 10,
 //     };
-//     data.test_consume_ready(14);
+//     g_state.test_consume_ready(14);
 //     // nothing prepared, requests 14; play() prepares 20
-//     // print("1a {} {}\n", .{ data.n_frames_ready, data.n_frames_requested });
-//     try play(alloc, &data);
-//     print("1b {} {}\n", .{ data.n_frames_ready, data.n_frames_requested });
-//     // try expect(data.n_frames_ready == 20);
+//     // print("1a {} {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested });
+//     try play(alloc, &g_state);
+//     print("1b {} {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested });
+//     // try expect(g_state.n_frames_ready == 20);
 
-//     data.test_consume_ready(18);
+//     g_state.test_consume_ready(18);
 //     // only plays 10
-//     // print("2a {} {}\n", .{ data.n_frames_ready, data.n_frames_requested });
-//     try play(alloc, &data);
-//     print("2b {} {}\n", .{ data.n_frames_ready, data.n_frames_requested });
-//     // try expect(data.n_frames_ready == 10);
+//     // print("2a {} {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested });
+//     try play(alloc, &g_state);
+//     print("2b {} {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested });
+//     // try expect(g_state.n_frames_ready == 10);
 
-//     data.test_consume_ready(40);
-//     // print("3a {} {}\n", .{ data.n_frames_ready, data.n_frames_requested });
-//     try play(alloc, &data);
-//     print("3b {} {}\n", .{ data.n_frames_ready, data.n_frames_requested });
-//     // try expect(data.n_frames_ready == 20);
+//     g_state.test_consume_ready(40);
+//     // print("3a {} {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested });
+//     try play(alloc, &g_state);
+//     print("3b {} {}\n", .{ g_state.n_frames_ready, g_state.n_frames_requested });
+//     // try expect(g_state.n_frames_ready == 20);
 // }
 
 /// For now, only create soundio context and pass callback
 /// (Taken from https://ziglang.org/learn/overview/ mostly)
-pub fn start_server(alloc: Allocator, n_min_frames: u32) !void {
+pub fn start_server(
+    alloc: Allocator,
+    n_min_frames: u32,
+    noteQueue: *NoteQueue,
+) !void {
     const soundio: *c.SoundIo = c.soundio_create();
     defer c.soundio_destroy(soundio);
 
@@ -119,7 +195,7 @@ pub fn start_server(alloc: Allocator, n_min_frames: u32) !void {
     const K: u32 = 2000;
     var bufL = try alloc.alloc(f32, K);
     var bufR = try alloc.alloc(f32, K);
-    var data = Data{
+    var g_state = GlobalState{
         .bufL = bufL,
         .bufR = bufR,
         .n_frames = frame_size,
@@ -151,7 +227,7 @@ pub fn start_server(alloc: Allocator, n_min_frames: u32) !void {
         return error.OutOfMemory;
     defer c.soundio_outstream_destroy(outstream);
 
-    outstream.userdata = @ptrCast(?*anyopaque, &data);
+    outstream.userdata = @ptrCast(?*anyopaque, &g_state);
     outstream.sample_rate = G.sample_rate;
     // the smallest I can get seems to be 0.01 on my machine.
     // this gives frame_count_max=112 most of the time, with occasionally
@@ -182,7 +258,7 @@ pub fn start_server(alloc: Allocator, n_min_frames: u32) !void {
     while (true) {
         print_vb("Loop\n", .{}, 3);
         t += 1;
-        try play(alloc, &data);
+        try play(alloc, &g_state, noteQueue);
         var end = std.time.nanoTimestamp();
         var elapsed_ns = end - begin;
         var remaining = @intToFloat(f32, t) * period_time;
@@ -203,19 +279,19 @@ fn write_callback(
     frame_count_max: c_int,
 ) callconv(.C) void {
     const ostream = maybe_ostream.?;
-    var data = @ptrCast(*Data, @alignCast(@alignOf(*Data), ostream.userdata));
+    var g_state = @ptrCast(*GlobalState, @alignCast(@alignOf(*GlobalState), ostream.userdata));
     print_vb("BEGIN write_callback(): frame_count_min={}, max={}\n", .{ frame_count_min, frame_count_max }, 3);
     var opt_areas: ?[*]c.SoundIoChannelArea = null;
     const fframe_count_max = @intCast(u32, frame_count_max);
-    var frames_to_write = @minimum(fframe_count_max, data.n_frames_ready);
+    var frames_to_write = @minimum(fframe_count_max, g_state.n_frames_ready);
     var total_written: u32 = frames_to_write;
     if (fframe_count_max > frames_to_write) {
         // in this case, since we write less data than is the maximum
         // possible, we request play() to write more data at the next timestep
-        data.n_frames_requested += fframe_count_max - frames_to_write;
+        g_state.n_frames_requested += fframe_count_max - frames_to_write;
     }
     var err: c_int = 0;
-    const bufs = [2][]f32{ data.bufL, data.bufR };
+    const bufs = [2][]f32{ g_state.bufL, g_state.bufR };
     var offset: u32 = 0;
     while (frames_to_write > 0) {
         var frame_count: c_int = @intCast(c_int, frames_to_write);
@@ -244,12 +320,12 @@ fn write_callback(
         print_vb("write_cb() end loop here, {} {} {}\n", .{ frame_count_max, frame_count, frames_to_write }, 3);
         frames_to_write -= @intCast(u32, frame_count);
     }
-    data.n_frames_ready -= total_written;
-    if (data.n_frames_ready > 0) {
+    g_state.n_frames_ready -= total_written;
+    if (g_state.n_frames_ready > 0) {
         // correct offset, since we generated data too much in advance
         // a bit wasteful, but probably necessary for real time
-        data.offset_seconds -= @intToFloat(f32, data.n_frames_ready) / @intToFloat(f32, G.sample_rate);
-        data.n_frames_ready = 0;
+        g_state.global_t -= @intToFloat(f32, g_state.n_frames_ready) / @intToFloat(f32, G.sample_rate);
+        g_state.n_frames_ready = 0;
     }
     _ = c.soundio_outstream_pause(ostream, false);
     print_vb("END write_callback()\n", .{}, 3);
