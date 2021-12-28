@@ -8,6 +8,8 @@ const Allocator = std.mem.Allocator;
 const sio_err = @import("sio_errors.zig").sio_err;
 const I = @import("instruments.zig");
 const Instrument = I.Instrument;
+const Signal = I.Signal;
+const FF = I.FF;
 const G = @import("global_config.zig");
 const expect = std.testing.expect;
 const Order = std.math.Order;
@@ -23,8 +25,6 @@ fn beginsSooner(context: void, a: *Instrument, b: *Instrument) Order {
 }
 
 const NoteQueue = std.PriorityQueue(*Instrument, void, beginsSooner);
-
-const global_volume: f32 = 0.20;
 
 const GlobalState = struct {
     bufL: []f32,
@@ -57,19 +57,26 @@ pub fn main() !u8 {
     defer arena.deinit();
     const allocator = arena.allocator();
     var noteQueue = NoteQueue.init(allocator, undefined);
-    var instr1 = I.Sine.init(0, 0.5, 440.0);
-    var instr2 = I.Sine.init(0.5, 0.5, 440.0 * (4.0 / 3.0));
-    var instr3 = I.Sine.init(1.0, 0.25, 440.0 * (5.0 / 3.0));
-    var instr4 = I.Sine.init(1.25, 0.5, 440.0 * (3.0 / 3.0));
-    var instr5 = I.Sine.init(1.25, 0.5, 440.0 * (4.0 / 3.0));
-    var instr6 = I.Sine.init(1.25, 0.5, 440.0 * (5.0 / 3.0));
+    var instr1 = try I.createOsc(allocator, 1.0, 0.1, 440.0);
+    var instr2 = try I.createOsc(allocator, 1.0, 0.05, 440.0 * (4.0 / 3.0));
+    var instr3 = try I.createOsc(allocator, 1.0, 0.025, 440.0 * (5.0 / 3.0));
+    try expect(instr1 != instr2);
 
-    try noteQueue.add(&instr1.instrument);
-    try noteQueue.add(&instr2.instrument);
-    try noteQueue.add(&instr3.instrument);
-    try noteQueue.add(&instr4.instrument);
-    try noteQueue.add(&instr5.instrument);
-    try noteQueue.add(&instr6.instrument);
+    _ = instr1;
+    _ = instr2;
+    _ = instr3;
+    try noteQueue.add(instr1);
+    try noteQueue.add(instr2);
+    try noteQueue.add(instr3);
+    // try noteQueue.add(&instr2.instrument);
+    // try noteQueue.add(&instr3.instrument);
+    // try noteQueue.add(&instr4.instrument);
+    // try noteQueue.add(&instr5.instrument);
+    // try noteQueue.add(&instr6.instrument);
+
+    var kick_i = try I.createKick(allocator, 0.3, 0.3, 100, 0.45);
+    try noteQueue.add(kick_i);
+    _ = kick_i;
     try start_server(allocator, 200, &noteQueue);
     return 0;
 }
@@ -98,6 +105,7 @@ pub fn play(
     const frames_left = g_state.n_frames_requested % g_state.n_frames;
     // play instruments, mix, etc.
     // first, zero out the buffers
+    // print("PLAY!!! {} {}\n", .{ g_state.bufL.len, frames_to_play });
     std.mem.set(f32, g_state.bufL[0..frames_to_play], 0);
     std.mem.set(f32, g_state.bufR[0..frames_to_play], 0);
     // there are 2 cases when we don't play anything
@@ -132,9 +140,9 @@ pub fn play(
         while (maybe_it.next()) |it| {
             const time_delta = g_state.global_t - it.approx_start_time;
             if (time_delta > tol) {
-                const instr_buf = it.play(time_delta, frames_to_play, global_volume);
+                const instr_buf = it.play(time_delta, frames_to_play);
                 for (instr_buf) |*b, i| {
-                    buf[i] += b.*;
+                    buf[i] += b.* * it.volume;
                 }
                 print_vb("Play {p} at time {}\n", .{ it, g_state.global_t }, 3);
             }
@@ -192,7 +200,7 @@ pub fn start_server(
     defer c.soundio_destroy(soundio);
 
     const frame_size = n_min_frames;
-    const K: u32 = 2000;
+    const K: u32 = 10000;
     var bufL = try alloc.alloc(f32, K);
     var bufR = try alloc.alloc(f32, K);
     var g_state = GlobalState{

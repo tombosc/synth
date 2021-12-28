@@ -28,7 +28,9 @@ pub fn build(b: *std.build.Builder) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
-    const files = [_][]const u8{ "src/server.zig", "src/instruments.zig" };
+    const files = [_][]const u8{
+        "src/server.zig", "src/instruments.zig",
+    };
     for (files) |f| {
         const exe_tests = b.addTest(f);
         exe_tests.setTarget(target);
