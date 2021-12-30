@@ -14,6 +14,8 @@ const G = @import("global_config.zig");
 const expect = std.testing.expect;
 const Order = std.math.Order;
 
+const NoteQueue = std.PriorityQueue(*Instrument, void, beginsSooner);
+
 fn beginsSooner(context: void, a: *Instrument, b: *Instrument) Order {
     _ = context;
     if (a.approx_start_time == b.approx_start_time) {
@@ -23,8 +25,6 @@ fn beginsSooner(context: void, a: *Instrument, b: *Instrument) Order {
     }
     return Order.gt;
 }
-
-const NoteQueue = std.PriorityQueue(*Instrument, void, beginsSooner);
 
 const GlobalState = struct {
     bufL: []f32,
@@ -57,9 +57,9 @@ pub fn main() !u8 {
     defer arena.deinit();
     const allocator = arena.allocator();
     var noteQueue = NoteQueue.init(allocator, undefined);
-    var instr1 = try I.createOsc(allocator, 1.0, 0.1, 440.0);
-    var instr2 = try I.createOsc(allocator, 1.0, 0.05, 440.0 * (4.0 / 3.0));
-    var instr3 = try I.createOsc(allocator, 1.0, 0.025, 440.0 * (5.0 / 3.0));
+    var instr1 = try I.createOsc(allocator, 0.0, 0.1, 440.0, -1);
+    var instr2 = try I.createOsc(allocator, 1.0, 0.05, 440.0 * (4.0 / 3.0), -1);
+    var instr3 = try I.createOsc(allocator, 1.0, 0.025, 440.0 * (5.0 / 3.0), -1);
     try expect(instr1 != instr2);
 
     _ = instr1;
@@ -74,10 +74,12 @@ pub fn main() !u8 {
     // try noteQueue.add(&instr5.instrument);
     // try noteQueue.add(&instr6.instrument);
 
-    var kick_i = try I.createKick(allocator, 0.3, 0.3, 100, 0.45);
+    var kick_i = try I.createKick(allocator, 0.0, 0.5, 100, 0.45);
     try noteQueue.add(kick_i);
     _ = kick_i;
-    try start_server(allocator, 200, &noteQueue);
+    const n_frames: u32 = 100;
+    const latency: f32 = 0.01;
+    try start_server(allocator, n_frames, latency, &noteQueue);
     return 0;
 }
 
@@ -86,7 +88,6 @@ inline fn print_vb(comptime fmt: []const u8, args: anytype, comptime verbose_lev
         print(fmt, args);
     }
 }
-
 pub fn play(
     alloc: Allocator,
     g_state: *GlobalState,
@@ -96,7 +97,7 @@ pub fn play(
         print_vb("NOT READ DATA!\n", .{}, 3);
         return;
     }
-
+    // @setRuntimeSafety(true);
     // only play multiples of g_state.n_frame. Necessary? sounds like a good idea for quantization purposes?
     const additional = (g_state.n_frames_requested) / g_state.n_frames;
     const frames_to_play = g_state.n_frames * (additional + 1);
@@ -189,15 +190,15 @@ pub fn play(
 pub fn start_server(
     alloc: Allocator,
     n_min_frames: u32,
+    latency: f32,
     noteQueue: *NoteQueue,
 ) !void {
     const soundio: *c.SoundIo = c.soundio_create();
     defer c.soundio_destroy(soundio);
 
     const frame_size = n_min_frames;
-    const K: u32 = 10000;
-    var bufL = try alloc.alloc(f32, K);
-    var bufR = try alloc.alloc(f32, K);
+    var bufL = try alloc.alloc(f32, G.buf_size);
+    var bufR = try alloc.alloc(f32, G.buf_size);
     var g_state = GlobalState{
         .bufL = bufL,
         .bufR = bufR,
@@ -235,7 +236,7 @@ pub fn start_server(
     // the smallest I can get seems to be 0.01 on my machine.
     // this gives frame_count_max=112 most of the time, with occasionally
     // higher values up to 216
-    outstream.software_latency = 0.01;
+    outstream.software_latency = latency;
     outstream.format = c.SoundIoFormatFloat32LE; // c.SoundIoFormatFloat32NE
     if (!c.soundio_device_supports_format(device, outstream.format)) {
         print("Format {s} not supported!\n", .{c.soundio_format_string(outstream.format)});
@@ -282,6 +283,7 @@ fn write_callback(
     frame_count_max: c_int,
 ) callconv(.C) void {
     const ostream = maybe_ostream.?;
+    // @setRuntimeSafety(true);
     var g_state = @ptrCast(*GlobalState, @alignCast(@alignOf(*GlobalState), ostream.userdata));
     print_vb("BEGIN write_callback(): frame_count_min={}, max={}\n", .{ frame_count_min, frame_count_max }, 3);
     var opt_areas: ?[*]c.SoundIoChannelArea = null;

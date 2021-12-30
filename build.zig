@@ -37,4 +37,7 @@ pub fn build(b: *std.build.Builder) void {
         exe_tests.setBuildMode(mode);
         test_step.dependOn(&exe_tests.step);
     }
+
+    const install_exe = b.addInstallArtifact(exe);
+    b.getInstallStep().dependOn(&install_exe.step);
 }
