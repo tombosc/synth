@@ -114,9 +114,6 @@ pub fn play(
     var dont_play: bool = false;
     // tol: tolerance to decide if we can play the note or not
     const tol = G.sec_per_frame * @intToFloat(f32, g_state.n_frames);
-    // intermediary buffer since we're doing mono
-    const buf = try alloc.alloc(f32, frames_to_play);
-    defer alloc.free(buf);
     while (noteQueue.peek()) |elem| {
         print_vb("Time {}, ftp {}\n", .{ g_state.global_t, frames_to_play }, 3);
         if (elem.over) {
@@ -142,15 +139,13 @@ pub fn play(
             if (time_delta > tol) {
                 const instr_buf = it.play(time_delta, frames_to_play);
                 for (instr_buf) |*b, i| {
-                    buf[i] += b.* * it.volume;
+                    g_state.bufL[i] += b.* * it.volume;
+                    g_state.bufR[i] += b.* * it.volume;
                 }
                 print_vb("Play {p} at time {}\n", .{ it, g_state.global_t }, 3);
             }
         }
     }
-    // mono
-    std.mem.copy(f32, g_state.bufL[0..frames_to_play], buf[0..frames_to_play]);
-    std.mem.copy(f32, g_state.bufR[0..frames_to_play], buf[0..frames_to_play]);
     // print("MAX {}\n", .{std.mem.max(f32, g_state.bufL[0..frames_to_play])});
     // update global state
     g_state.n_frames_ready = frames_to_play;
