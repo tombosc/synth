@@ -11,20 +11,8 @@ const Instrument = I.Instrument;
 const Signal = I.Signal;
 const FF = I.FF;
 const G = @import("global_config.zig");
+const network = @import("network.zig");
 const expect = std.testing.expect;
-const Order = std.math.Order;
-
-const NoteQueue = std.PriorityQueue(*Instrument, void, beginsSooner);
-
-fn beginsSooner(context: void, a: *Instrument, b: *Instrument) Order {
-    _ = context;
-    if (a.approx_start_time == b.approx_start_time) {
-        return Order.eq;
-    } else if (a.approx_start_time < b.approx_start_time) {
-        return Order.lt;
-    }
-    return Order.gt;
-}
 
 const GlobalState = struct {
     bufL: []f32,
@@ -56,7 +44,7 @@ pub fn main() !u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var noteQueue = NoteQueue.init(allocator, undefined);
+    var noteQueue = I.NoteQueue.init(allocator, undefined);
     var instr1 = try I.createOsc(allocator, 0.0, 0.1, 440.0, -1);
     var instr2 = try I.createOsc(allocator, 1.0, 0.05, 440.0 * (4.0 / 3.0), -1);
     var instr3 = try I.createOsc(allocator, 1.0, 0.025, 440.0 * (5.0 / 3.0), -1);
@@ -65,21 +53,29 @@ pub fn main() !u8 {
     _ = instr1;
     _ = instr2;
     _ = instr3;
-    try noteQueue.add(instr1);
-    try noteQueue.add(instr2);
-    try noteQueue.add(instr3);
+    // try noteQueue.add(instr1);
+    // try noteQueue.add(instr2);
+    // try noteQueue.add(instr3);
     // try noteQueue.add(&instr2.instrument);
     // try noteQueue.add(&instr3.instrument);
     // try noteQueue.add(&instr4.instrument);
     // try noteQueue.add(&instr5.instrument);
     // try noteQueue.add(&instr6.instrument);
 
-    var kick_i = try I.createKick(allocator, 0.0, 0.5, 100, 0.45);
-    try noteQueue.add(kick_i);
+    var kick_i = try I.createKick(allocator, 0.0, 0.5, 100, 0.45, true);
+    // try noteQueue.add(kick_i);
     _ = kick_i;
-    const n_frames: u32 = 100;
-    const latency: f32 = 0.01;
-    try start_server(allocator, n_frames, latency, &noteQueue);
+    const n_frames: u32 = 1000;
+    const latency: f32 = @intToFloat(f32, n_frames) * 4 / @intToFloat(f32, G.sample_rate);
+    // NETWORK
+    const thread = try std.Thread.spawn(
+        .{},
+        network.listenToEvents,
+        .{ allocator, &noteQueue },
+    );
+    thread.detach();
+
+    try startServer(allocator, n_frames, latency, &noteQueue);
     return 0;
 }
 
@@ -91,7 +87,7 @@ inline fn print_vb(comptime fmt: []const u8, args: anytype, comptime verbose_lev
 pub fn play(
     alloc: Allocator,
     g_state: *GlobalState,
-    noteQueue: *NoteQueue,
+    noteQueue: *I.NoteQueue,
 ) !void {
     if (g_state.n_frames_ready > 0) { // data hasn't been read yet!
         print_vb("NOT READ DATA!\n", .{}, 3);
@@ -138,12 +134,16 @@ pub fn play(
         while (maybe_it.next()) |it| {
             const time_delta = g_state.global_t - it.approx_start_time;
             if (time_delta > tol) {
-                const instr_buf = it.play(time_delta, frames_to_play);
+                if (!it.started) {
+                    it.real_start_time = g_state.global_t;
+                }
+                const real_time_delta = g_state.global_t - it.real_start_time;
+                const instr_buf = it.play(real_time_delta, frames_to_play);
                 for (instr_buf) |*b, i| {
                     g_state.bufL[i] += b.* * it.volume;
                     g_state.bufR[i] += b.* * it.volume;
                 }
-                print_vb("Play {p} at time {}\n", .{ it, g_state.global_t }, 3);
+                print_vb("Play {p} at time {}\n", .{ it, g_state.global_t }, 4);
             }
         }
     }
@@ -187,11 +187,11 @@ pub fn play(
 
 /// For now, only create soundio context and pass callback
 /// (Taken from https://ziglang.org/learn/overview/ mostly)
-pub fn start_server(
+pub fn startServer(
     alloc: Allocator,
     n_min_frames: u32,
     latency: f32,
-    noteQueue: *NoteQueue,
+    noteQueue: *I.NoteQueue,
 ) !void {
     const soundio: *c.SoundIo = c.soundio_create();
     defer c.soundio_destroy(soundio);
@@ -205,11 +205,9 @@ pub fn start_server(
         .n_frames = frame_size,
     };
 
-    // const backend = c.SoundIoBackend.Alsa;
+    // const backend = c.SoundIoBackendAlsa;
     // default is "PulseAudio", but it is slow!
     // print("{}\n", .{@typeInfo(c.enum_SoundIoBackend)});
-    // const backend = c.enum_SoundIoBackend.PulseAudio;
-    // const backend: c.enum_SoundIoBackend = c.SoundIoBackendPulseAudio;
     const backend = c.SoundIoBackendPulseAudio;
     try sio_err(c.soundio_connect_backend(soundio, backend));
 
@@ -226,6 +224,10 @@ pub fn start_server(
 
     const device: *c.SoundIoDevice = c.soundio_get_output_device(soundio, device_index);
     defer c.soundio_device_unref(device);
+
+    print("Modify start TS {}\n", .{G.start_timestamp});
+    G.start_timestamp = std.time.nanoTimestamp();
+    print("Modify after start TS {}\n", .{G.start_timestamp});
 
     const outstream: *c.SoundIoOutStream = c.soundio_outstream_create(device) orelse
         return error.OutOfMemory;
@@ -263,14 +265,15 @@ pub fn start_server(
         print_vb("Loop\n", .{}, 3);
         t += 1;
         try play(alloc, &g_state, noteQueue);
-        var end = std.time.nanoTimestamp();
-        var elapsed_ns = end - begin;
-        var remaining = @intToFloat(f32, t) * period_time;
-        var elapsed = @intToFloat(f32, elapsed_ns) / 1e9;
+        const now = std.time.nanoTimestamp();
+        const elapsed_ns = now - begin;
+        const remaining = @intToFloat(f32, t) * period_time;
+        const elapsed = @intToFloat(f32, elapsed_ns) / 1e9;
+        print("Remaining time {}, request {}, queue={}\n", .{ remaining - elapsed, g_state.n_frames_requested, noteQueue.count() });
         if ((remaining - elapsed) < 0) {
-            print_vb("Running late!\n", .{}, 1);
+            print_vb("Running late! {}\n", .{remaining - elapsed}, 1);
         } else {
-            var sleep_ns = @floatToInt(u64, @maximum(remaining - elapsed, 0) * 1e9);
+            var sleep_ns = @floatToInt(u64, @maximum(remaining - elapsed, 0) * 1e9 * 0.90);
             std.time.sleep(sleep_ns);
             print_vb("Sleep {}ns\n", .{sleep_ns}, 3);
         }

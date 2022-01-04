@@ -10,6 +10,20 @@ const expectError = std.testing.expectError;
 const buf_size: u32 = G.buf_size;
 const zero_buf = [_]f32{0.0} ** buf_size;
 
+const Order = std.math.Order;
+
+fn beginsSooner(context: void, a: *Instrument, b: *Instrument) Order {
+    _ = context;
+    if (a.approx_start_time == b.approx_start_time) {
+        return Order.eq;
+    } else if (a.approx_start_time < b.approx_start_time) {
+        return Order.lt;
+    }
+    return Order.gt;
+}
+
+pub const NoteQueue = std.PriorityQueue(*Instrument, void, beginsSooner);
+
 pub const Instrument = struct {
     /// Interface for instruments.
     /// runtime polymorphism inspired by https://zig.news/david_vanderson/interfaces-in-zig-o1c
@@ -23,11 +37,22 @@ pub const Instrument = struct {
     deinitFn: fn (*Instrument, Allocator) void,
     approx_start_time: f32,
     volume: f32,
+    real_start_time: f32 = 0,
     over: bool = false,
+    started: bool = false,
 
     pub fn play(instr: *Instrument, t0: f32, n_frames: u32) []const f32 {
-        // print("PL {*}\n", .{instr});
-        return (instr.playFn)(instr, t0, n_frames);
+        instr.started = true;
+        const buf = (instr.playFn)(instr, t0, n_frames);
+        // set over to true when all zeros
+        var s: f32 = 0;
+        for (buf) |v| {
+            s += @fabs(v);
+        }
+        if (s <= 0.0001) {
+            instr.over = true;
+        }
+        return buf;
     }
     pub fn deinit(instr: *Instrument, alloc: Allocator) void {
         return (instr.deinitFn)(instr, alloc);
@@ -41,31 +66,44 @@ pub const Signal = union(enum) {
 
 // one way to create an instrument and compose them easily. See createKick for example.
 /// * f: a function with signature: fn(f32, ...), where
-///   - f32 is t0
+///   - f32 is time
 ///   - the rest of the arguments are other values
 /// * L: the number of other arguments (except t0)
 /// * InputTypes: either f32 for float constant, or the FF generated type (not Instrument, despite the name)
 pub fn FF(comptime f: anytype, comptime InputTypes: anytype, comptime EnvelopeType: ?type) type {
     // TODO instead of a simple function of a single f32 time that returns a single f32,
     // take a whole []f32 and return []f32?
-    // benefits: 1) faster and 2) allows for filters?
-    const PlainFnArgsType = comptime std.meta.ArgsTuple(@TypeOf(f));
-    const L = comptime InputTypes.len;
+    // benefits: 1) faster? 2) allows for filters?
+
+    const dynamic = switch (@typeInfo(@TypeOf(InputTypes))) {
+        .ComptimeInt => true,
+        .Struct => false,
+        else => return error.Wrong,
+    };
+
+    const PlainFnArgsType = std.meta.ArgsTuple(@TypeOf(f));
+
+    const L = switch (dynamic) {
+        true => InputTypes,
+        false => InputTypes.len,
+    };
+
     // TODO reinstate this check?
     // const args_tmp: PlainFnArgsType = undefined;
     // args only used in the following check:
     // if ((args_tmp.len - 1) != L) {
     //     return error.WrongArgNumber;
     // }
-    const PlayFnArgsType = std.meta.ArgsTuple(@TypeOf(Instrument.play));
 
     return struct {
         instrument: Instrument,
         inputs: [L]Signal,
         envelope: ?Signal,
+        dynamic: bool,
         buf: []f32,
 
         pub fn play(instr: *Instrument, t0: f32, n_frames: u32) []const f32 {
+            const PlayFnArgsType = std.meta.ArgsTuple(@TypeOf(@This().play));
             // @setRuntimeSafety(true);
             var self = @fieldParentPtr(@This(), "instrument", instr);
 
@@ -75,25 +113,54 @@ pub fn FF(comptime f: anytype, comptime InputTypes: anytype, comptime EnvelopeTy
             }
 
             var args: PlainFnArgsType = undefined;
+            // var args: [L]f32 = [_]f32{0} ** L;
+            // if (!dynamic) {
+            //     inline for (InputTypes) |_, i| {
+            //         args[i] = 0.0;
+            //     }
+            // } else {
+            //     for (args) |*a, i| {
+            //         a.* = 0.0;
+            //         _ = i;
+            //     }
+            // }
 
             var res_bufs = [_]?[]const f32{undefined} ** (L);
-            inline for (InputTypes) |IType, i| {
-                switch (IType) {
-                    f32 => {
-                        args[i + 1] = self.inputs[i].constant;
-                    },
-                    else => {
-                        var sub_args: PlayFnArgsType = undefined;
-                        sub_args[0] = self.inputs[i].instrument;
-                        sub_args[1] = t0;
-                        sub_args[2] = n_frames;
-                        // print("L={}, instr={*}, sub_args={}\n", .{ L, instr, sub_args });
-                        // dynamic dispatch was
-                        // res_bufs[i] = @call(.{}, self.inputs[i].instrument.playFn, sub_args);
-                        // static dispatch:
-                        res_bufs[i] = @call(.{}, IType.play, sub_args);
-                        // print("subcall {}\n", .{res_bufs[i].?[5]});
-                    },
+            var dynamic_args = [_]f32{0.0} ** (L);
+            if (!dynamic) {
+                inline for (InputTypes) |IType, i| {
+                    switch (IType) {
+                        f32 => {
+                            args[i + 1] = self.inputs[i].constant;
+                        },
+                        else => {
+                            var sub_args: PlayFnArgsType = undefined;
+                            sub_args[0] = self.inputs[i].instrument;
+                            sub_args[1] = t0;
+                            sub_args[2] = n_frames;
+                            // print("L={}, instr={*}, sub_args={}\n", .{ L, instr, sub_args });
+                            // dynamic dispatch was
+                            // res_bufs[i] = @call(.{}, self.inputs[i].instrument.playFn, sub_args);
+                            // static dispatch:
+                            res_bufs[i] = @call(.{}, IType.play, sub_args);
+                            // print("subcall {}\n", .{res_bufs[i].?[5]});
+                        },
+                    }
+                }
+            } else {
+                for (self.inputs) |input, j| {
+                    switch (input) {
+                        .constant => {
+                            dynamic_args[j] = input.constant;
+                        },
+                        .instrument => {
+                            var sub_args: PlayFnArgsType = undefined;
+                            sub_args[0] = input.instrument;
+                            sub_args[1] = t0;
+                            sub_args[2] = n_frames;
+                            res_bufs[j] = @call(.{}, input.instrument.playFn, sub_args);
+                        },
+                    }
                 }
             }
             var env_buf: ?[]const f32 = null;
@@ -113,16 +180,36 @@ pub fn FF(comptime f: anytype, comptime InputTypes: anytype, comptime EnvelopeTy
             for (self.buf[0..n_frames]) |*v, t| {
                 const ft = @intToFloat(f32, t);
                 // print("wrap L {}, args {}, {}\n", .{ L, args, @field(args, "0") });
-                args[0] = t0 + (ft * G.sec_per_frame);
-                inline for (InputTypes) |IType, i| {
-                    switch (IType) {
-                        f32 => {},
-                        else => {
-                            args[i + 1] = res_bufs[i].?[t];
-                        },
+                var result: f32 = undefined;
+                if (!dynamic) {
+                    args[0] = t0 + (ft * G.sec_per_frame);
+                    inline for (InputTypes) |IType, i| {
+                        switch (IType) {
+                            f32 => {},
+                            else => {
+                                args[i + 1] = res_bufs[i].?[t];
+                            },
+                        }
+                    }
+                    result = @call(.{}, f, args);
+                } else {
+                    for (self.inputs) |input, j| {
+                        switch (input) {
+                            .instrument => {
+                                dynamic_args[j] = res_bufs[j].?[t];
+                            },
+                            .constant => {},
+                        }
+                    }
+                    var tt = t0 + (ft * G.sec_per_frame);
+                    if (L == 1) {
+                        result = f(tt, dynamic_args[0]);
+                    } else if (L == 2) {
+                        result = f(tt, dynamic_args[0], dynamic_args[1]);
+                    } else if (L == 3) {
+                        result = f(tt, dynamic_args[0], dynamic_args[1], dynamic_args[2]);
                     }
                 }
-                var result = @call(.{}, f, args);
                 if (env_val) |env_val_| {
                     v.* = result * env_val_;
                 } else if (env_buf) |env_buf_| {
@@ -160,6 +247,7 @@ pub fn FF(comptime f: anytype, comptime InputTypes: anytype, comptime EnvelopeTy
                 .inputs = instruments,
                 .envelope = envelope,
                 .buf = buf,
+                .dynamic = dynamic,
             };
             print("Init instr {*}\n", .{&a.instrument});
             return a;
@@ -205,17 +293,26 @@ pub fn createOsc(alloc: Allocator, t0: f32, vol: f32, f: f32, slope: f32) !*Inst
     return &osc_.instrument;
 }
 
-pub fn createKick(alloc: Allocator, t0: f32, vol: f32, f: f32, v: f32) !*Instrument {
+pub fn createKick(alloc: Allocator, t0: f32, vol: f32, f: f32, v: f32, comptime static: bool) !*Instrument {
     var ins = [_]Signal{
         .{ .constant = f },
         .{ .constant = v },
     };
-    const KF = FF(kickFreq, .{ f32, f32 }, null);
-    var kick_freq = try KF.init(alloc, t0, 0.0, 1.0, ins, null);
-    // var kick_freq = try FF(kickFreq, 2).init(alloc, t0, 0.0, 1.0, ins);
 
-    const K = FF(osc, .{KF}, null);
-    var kick = try K.init(alloc, t0, 0.0, vol, [1]Signal{.{ .instrument = &kick_freq.instrument }}, null);
+    const KF = switch (static) {
+        true => FF(kickFreq, .{ f32, f32 }, null),
+        false => FF(kickFreq, 2, null),
+    };
+
+    var kick_freq = try KF.init(alloc, t0, 0.0, 1.0, ins, null);
+
+    const Env = FF(linearEnv, .{f32}, null);
+    var linear_env = try Env.init(alloc, t0, 0.0, 1.0, [1]Signal{.{ .constant = -1.0 }}, null);
+    const K = switch (static) {
+        true => FF(osc, .{KF}, Env),
+        false => FF(osc, 1, Env),
+    };
+    var kick = try K.init(alloc, t0, 0.0, vol, [1]Signal{.{ .instrument = &kick_freq.instrument }}, Signal{ .instrument = &linear_env.instrument });
     // print("Here, init kick {*}\n", .{kick.instrument});
     return &kick.instrument;
 }
@@ -226,44 +323,37 @@ pub fn fullKick(t: f32, f: f32, v: f32) f32 {
 }
 
 // Single function kick to test performance
-pub fn createFastKick(alloc: Allocator, t0: f32, vol: f32, f: f32, v: f32) !*Instrument {
+pub fn createFastKick(alloc: Allocator, t0: f32, vol: f32, f: f32, v: f32, comptime static: bool) !*Instrument {
     var ins = [_]Signal{
         .{ .constant = f },
         .{ .constant = v },
     };
-    const KF = FF(fullKick, .{ f32, f32 }, null);
+    const KF = switch (static) {
+        true => FF(fullKick, .{ f32, f32 }, null),
+        false => FF(fullKick, 2, null),
+    };
     var kick_freq = try KF.init(alloc, t0, 0.0, vol, ins, null);
+    print("Create static ? {} kick {}\n", .{ static, !kick_freq.dynamic });
     return &kick_freq.instrument;
 }
 
-pub fn benchmarkInstrument(instr: *Instrument, n_frames: u32) f32 {
-    var begin = std.time.nanoTimestamp();
-    var i: u32 = 0;
-    var buf: []const f32 = undefined;
-    while (i < 10000) : (i += 1) {
-        var t0: f32 = @intToFloat(f32, i) * (G.sec_per_frame * @intToFloat(f32, n_frames));
-        buf = instr.play(t0, n_frames);
-        // print("max{}\n", .{std.mem.max(f32, buf)});
-        // print("min{}\n", .{std.mem.min(f32, buf)});
-    }
-    var end = std.time.nanoTimestamp();
-    print("buf:{} {} {} {} {}\n", .{ buf[0], buf[1], buf[2], buf[3], buf[4] });
-    return @intToFloat(f32, (end - begin)) / 1000000000.0;
-}
+test "dynamic dispatch" {
+    // var alloc = std.testing.allocator;
+    // var ins = [_]Signal{
+    //     .{ .constant = 100 },
+    //     .{ .constant = 0.5 },
+    // };
+    // const t0: f32 = 0.0;
+    // const KF = FF(kickFreq, 2, null);
+    // var kick_freq = try KF.init(alloc, t0, 0.0, 1.0, ins, null);
+    // // var kick_freq = try FF(kickFreq, 2).init(alloc, t0, 0.0, 1.0, ins);
 
-test "kick" {
-    var alloc = std.testing.allocator;
-    // fast kick
-    var kick_f_i = try createFastKick(alloc, 0.3, 0.3, 100, 0.45);
-    defer kick_f_i.deinit(alloc);
-    var time = benchmarkInstrument(kick_f_i, 200);
-    print("Time: {}\n", .{time});
-
-    var kick_i = try createKick(alloc, 0.3, 0.3, 100, 0.45);
-    // var kick_i = try createOsc(alloc, 0.3, 0.3, 100);
-    defer kick_i.deinit(alloc);
-    time = benchmarkInstrument(kick_i, 200);
-    print("Time: {}\n", .{time});
+    // const K = FF(osc, 1, null);
+    // var kick = try K.init(alloc, t0, 0.0, 1.0, [1]Signal{.{ .instrument = &kick_freq.instrument }}, null);
+    // defer kick.instrument.deinit(alloc);
+    // instruments = InstrumentList.init(alloc)
+    // var time = benchmarkInstruments(&kick.instrument, 200);
+    // print("Time: {}\n", .{time});
 }
 
 test "comptime loop" {
